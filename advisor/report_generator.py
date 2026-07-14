@@ -30,7 +30,7 @@ def profile_from_llm_assessment(llm_result: dict, expected_daily_volume: int,
 
 
 def generate_report(profile: ProjectProfile, llm_nuance: dict = None,
-                     cost_projection=None) -> str:
+                     cost_projection=None, model_recommendation=None) -> str:
     findings = run_rules_engine(profile)
 
     lines = ["# AI Implementation Readiness Report\n"]
@@ -60,6 +60,14 @@ def generate_report(profile: ProjectProfile, llm_nuance: dict = None,
         for a in cost_projection.assumptions:
             lines.append(f"  - {a}")
         lines.append("")
+
+    if model_recommendation:
+        lines.append("## 🔀 Recommended Model")
+        lines.append(f"**{model_recommendation.model_name}** ({model_recommendation.provider}) "
+                     f"-- est. ${model_recommendation.monthly_cost}/month, "
+                     f"fit score {model_recommendation.fit_score}, "
+                     f"vendor risk: {model_recommendation.risk_band}")
+        lines.append(f"\n{model_recommendation.reasoning}\n")
 
     blockers = [f for f in findings if f.severity == "blocker"]
     if blockers:
@@ -101,5 +109,22 @@ if __name__ == "__main__":
                                      "before finalizing the privacy approach.",
     }
 
-    report = generate_report(profile, llm_nuance=fake_llm_nuance, cost_projection=cost_result)
+    # Optional: model_recommendation demo (uses model_comparison, which is
+    # independent of this module -- report_generator still works fine
+    # without it, this block just shows the wiring).
+    try:
+        from model_comparison.catalog import MODEL_CATALOG
+        from model_comparison.comparator import TaskType, rank_models_by_fit, score_vendor_risk, build_recommendation
+
+        fit_results = rank_models_by_fit(MODEL_CATALOG, TaskType.CHATBOT,
+                                          monthly_input_tokens=27_000, monthly_output_tokens=7_500,
+                                          quality_bar="mid")
+        top = fit_results[0]
+        risk = score_vendor_risk(top.model.provider)
+        model_recommendation = build_recommendation(top, risk, TaskType.CHATBOT)
+    except ImportError:
+        model_recommendation = None
+
+    report = generate_report(profile, llm_nuance=fake_llm_nuance, cost_projection=cost_result,
+                              model_recommendation=model_recommendation)
     print(report)

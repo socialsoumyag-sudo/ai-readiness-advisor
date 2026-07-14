@@ -25,6 +25,9 @@ from rules_engine.engine import ProjectProfile, DataSensitivity, InputTrust, Tas
 from cost_estimator.estimator import TransactionBaseline, PricingModel, ProjectionInputs, GrowthCurve, project_cost
 from advisor.report_generator import generate_report, profile_from_llm_assessment
 from privacy.redaction import prepare_for_llm
+from model_comparison.catalog import MODEL_CATALOG, LAST_VERIFIED
+from model_comparison.comparator import (TaskType, rank_models_by_fit, compute_self_host_breakeven,
+                                          score_vendor_risk, build_recommendation)
 
 st.set_page_config(page_title="AI Implementation Readiness Advisor", layout="wide")
 
@@ -86,6 +89,107 @@ def render_cost_inputs():
                 st.markdown(f"- {a}")
 
 
+def render_model_comparison():
+    st.subheader("🔀 Multi-LLM Cost & Fit Comparison")
+    st.caption(
+        f"Prices last manually verified: **{LAST_VERIFIED}** — a periodically updated "
+        "snapshot, not a live feed. Several tools already do real-time pricing "
+        "aggregation well; this answers a different question: which model is actually "
+        "worth it for this task, this volume, and this org's risk tolerance — not just "
+        "which is cheapest per token. No API call involved in this section."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        task_type = st.selectbox(
+            "Task type",
+            options=list(TaskType),
+            format_func=lambda t: t.value.replace("_", " ").title(),
+        )
+        quality_bar = st.select_slider("Minimum quality bar", options=["low", "mid", "frontier"], value="mid")
+    with col2:
+        monthly_input = st.number_input("Estimated monthly input tokens", min_value=0, value=20_000_000,
+                                         step=1_000_000, key="mc_input_tokens")
+        monthly_output = st.number_input("Estimated monthly output tokens", min_value=0, value=8_000_000,
+                                          step=1_000_000, key="mc_output_tokens")
+
+    if st.button("Compare models", type="primary", key="model_comparison_submit"):
+        results = rank_models_by_fit(
+            catalog=MODEL_CATALOG,
+            task_type=task_type,
+            monthly_input_tokens=int(monthly_input),
+            monthly_output_tokens=int(monthly_output),
+            quality_bar=quality_bar,
+        )
+        st.session_state["model_comparison"] = results
+        st.session_state["model_comparison_task"] = task_type
+        if results:
+            top_risk = score_vendor_risk(results[0].model.provider)
+            st.session_state["model_recommendation"] = build_recommendation(results[0], top_risk, task_type)
+        else:
+            st.session_state["model_recommendation"] = None
+        st.success("Comparison calculated below, and the top recommendation will also be included "
+                   "automatically if you generate a report from the Structured Form or Free-Text tab.")
+
+    results = st.session_state.get("model_comparison")
+    if results:
+        st.divider()
+        if not results:
+            st.warning("No models meet this quality bar. Try lowering it.")
+        else:
+            st.markdown("**Ranked by Fit Score** (blends quality tier, monthly cost, and context-window fit)")
+            table_data = [
+                {
+                    "Model": r.model.display_name,
+                    "Provider": r.model.provider,
+                    "Quality Tier": r.model.quality_tier.value,
+                    "Est. Monthly Cost ($)": r.monthly_cost,
+                    "Fit Score": r.fit_score,
+                    "Context OK": "✅" if r.context_ok else "⚠️ Too small for task",
+                }
+                for r in results
+            ]
+            st.dataframe(table_data, use_container_width=True, hide_index=True)
+
+            top = results[0]
+            st.success(
+                f"**Recommended: {top.model.display_name}** — Fit Score {top.fit_score}, "
+                f"est. ${top.monthly_cost}/month at this volume. {top.model.notes}"
+            )
+
+            st.markdown("#### Self-host breakeven")
+            st.caption("Compares the top-ranked open-weight model's API price against self-hosting it.")
+            open_weight_results = [r for r in results if r.model.open_weight]
+            if open_weight_results:
+                best_open = open_weight_results[0]
+                be = compute_self_host_breakeven(
+                    best_open.model,
+                    current_monthly_tokens_millions=(monthly_input + monthly_output) / 1_000_000,
+                )
+                m1, m2 = st.columns(2)
+                m1.metric("Blended API price ($/1M tokens)", f"${be.blended_api_price_per_million}")
+                m2.metric("Breakeven volume (M tokens/mo)",
+                          f"{be.breakeven_tokens_millions:.1f}" if be.breakeven_tokens_millions != float("inf") else "Never")
+                st.info(be.verdict)
+            else:
+                st.caption("No open-weight model met the quality bar for this task — self-host comparison skipped.")
+
+            st.markdown("#### Vendor risk")
+            risk = score_vendor_risk(top.model.provider)
+            st.warning(f"**{top.model.provider}** — {risk.risk_band} (composite {risk.composite_risk}/5). {risk.notes}")
+
+            with st.expander("Assumptions behind this comparison"):
+                st.markdown(
+                    "- Pricing is manually-verified list pricing; does not account for prompt "
+                    "caching, batch discounts, or negotiated enterprise rates.\n"
+                    "- Self-host breakeven uses simple, editable infra-cost assumptions "
+                    "(default: one on-demand GPU instance) — meant to anchor a planning "
+                    "conversation, not replace a real infra estimate.\n"
+                    "- Vendor risk scores are opinionated starting points for review, not a "
+                    "substitute for legal/procurement due diligence."
+                )
+
+
 def render_structured_form():
     st.subheader("📋 Structured Assessment")
 
@@ -118,7 +222,9 @@ def render_structured_form():
             has_existing_deterministic_solution=has_deterministic,
         )
         cost_projection = st.session_state.get("cost_projection")
-        report = generate_report(profile, llm_nuance=None, cost_projection=cost_projection)
+        model_recommendation = st.session_state.get("model_recommendation")
+        report = generate_report(profile, llm_nuance=None, cost_projection=cost_projection,
+                                  model_recommendation=model_recommendation)
         st.session_state["report"] = report
 
 
@@ -171,7 +277,9 @@ def render_freetext_input():
         profile = profile_from_llm_assessment(llm_result, expected_daily_volume=int(daily_volume),
                                                 has_existing_deterministic_solution=has_deterministic)
         cost_projection = st.session_state.get("cost_projection")
-        report = generate_report(profile, llm_nuance=llm_result, cost_projection=cost_projection)
+        model_recommendation = st.session_state.get("model_recommendation")
+        report = generate_report(profile, llm_nuance=llm_result, cost_projection=cost_projection,
+                                  model_recommendation=model_recommendation)
         st.session_state["report"] = report
 
         if "_usage" in llm_result:
@@ -215,8 +323,9 @@ where it earns its cost, and plain code everywhere else.
 def main():
     render_header()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Structured Form", "✍️ Free-Text Input",
-                                        "💰 Cost Projection", "🎯 Philosophy"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 Structured Form", "✍️ Free-Text Input",
+                                              "💰 Cost Projection", "🔀 Model Comparison",
+                                              "🎯 Philosophy"])
 
     with tab3:
         render_cost_inputs()
@@ -228,6 +337,9 @@ def main():
         render_freetext_input()
 
     with tab4:
+        render_model_comparison()
+
+    with tab5:
         render_philosophy()
 
     render_report()
